@@ -172,6 +172,10 @@ class InputProcessor {
     }
 
     async _processChangedFiles() {
+        // Store original PR base before any modifications
+        const originalPRBase = this._baseCommit;
+        let incrementalBaseCommit = this._baseCommit;
+
         const comments = await this._githubAPI.listPRComments(this._owner, this._repo, this._pullNumber);
         const lastReviewComment = [...comments].reverse().find(c => c.body && c.body.startsWith(AI_REVIEW_COMMENT_PREFIX));
 
@@ -184,19 +188,24 @@ class InputProcessor {
                 .trim();
 
             if (newBaseCommit) {
-                core.info(`New base commit ${newBaseCommit}. Incremental review will be performed`);
-                this._baseCommit = newBaseCommit;
+                incrementalBaseCommit = newBaseCommit;
+                core.info(`Incremental review from ${newBaseCommit} to ${this._headCommit}`);
             }
         } else {
-            core.info("No previous review comments found, reviewing all files in PR");
+            core.info("Full PR review: no previous review found");
         }
 
-        const changedFiles = await this._githubAPI.getFilesBetweenCommits(
+        let changedFiles = await this._githubAPI.getFilesBetweenCommits(
             this._owner,
             this._repo,
-            this._baseCommit,
+            incrementalBaseCommit,
             this._headCommit
         );
+
+        // Filter out merge-only files if doing incremental review
+        if (incrementalBaseCommit !== originalPRBase) {
+            changedFiles = await this._filterMergeOnlyFiles(changedFiles, originalPRBase);
+        }
 
         this._filteredDiffs = this._filterChangedFiles(
             changedFiles,
@@ -206,7 +215,58 @@ class InputProcessor {
             this._excludePaths
         );
 
-        core.info(`Found ${this._filteredDiffs.length} files to review`);
+        core.info(`Found ${this._filteredDiffs.length} files to review after all filtering`);
+    }
+
+    /**
+     * Filters out merge-only files from incremental review.
+     *
+     * When a PR branch is synced with the target branch (e.g., merging main into the PR),
+     * the incremental diff includes files changed by the merge commit that are not part
+     * of the developer's actual changes. This method filters those out by comparing:
+     *
+     * 1. Incremental diff: files changed since last review
+     * 2. Whole PR diff: files changed in the entire PR (from original base to head)
+     *
+     * Only files present in BOTH diffs are kept for review.
+     *
+     * Why this is needed:
+     * - Without filtering, AI would review code already in the target branch
+     * - Wastes tokens and clutters PR with comments on code the author didn't write
+     * - Provides better "best effort" incremental review experience
+     *
+     * @param {Array} changedFiles - Files changed since last review
+     * @param {string} originalPRBase - Original PR base commit (target branch)
+     * @returns {Promise<Array>} Filtered list of files to review
+     */
+    async _filterMergeOnlyFiles(changedFiles, originalPRBase) {
+        core.info(`Filtering incremental files against whole PR (base: ${originalPRBase})`);
+
+        const wholePRFiles = await this._githubAPI.getFilesBetweenCommits(
+            this._owner,
+            this._repo,
+            originalPRBase,
+            this._headCommit
+        );
+
+        // Create set of filenames in whole PR for fast lookup
+        const wholePRFilenames = new Set(wholePRFiles.map(f => f.filename));
+
+        // Filter: only keep files that exist in both incremental AND whole PR
+        const beforeCount = changedFiles.length;
+        const filteredFiles = changedFiles.filter(f => wholePRFilenames.has(f.filename));
+
+        core.info(`Filtered ${beforeCount} incremental files to ${filteredFiles.length} PR-relevant files`);
+
+        // Log filtered-out files at debug level for troubleshooting
+        if (beforeCount > filteredFiles.length) {
+            const filteredOut = changedFiles
+                .filter(f => !wholePRFilenames.has(f.filename))
+                .map(f => f.filename);
+            core.debug(`Filtered out merge-only files: ${filteredOut.join(', ')}`);
+        }
+
+        return filteredFiles;
     }
 
     _filterChangedFiles(changedFiles, includeExtensions, excludeExtensions, includePaths, excludePaths) {
