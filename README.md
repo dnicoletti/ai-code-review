@@ -5,6 +5,21 @@
 
 Perform code review using various AI models from OpenAI, Anthropic, Google, X, Deepseek or Perplexity to analyze and provide feedback on your code. This GitHub Action helps improve the code quality by automatically reviewing pull requests, focusing on specified file extensions, and excluding specific paths.
 
+## Features
+
+### Incremental Reviews
+The action tracks what has been reviewed. When new commits are pushed to a PR, only the new changes are reviewed, not the entire PR again. This is done by finding the last AI review comment and comparing changes since that commit.
+
+### Merge Filtering (Best Effort)
+When a PR branch is synced with the target branch (e.g., merging `main` into your feature branch), the action attempts to exclude code changes that came from the merge and only review your actual contributions.
+
+This filtering works at the **hunk level** (individual change blocks within files):
+- Compares changes since last review against the entire PR
+- Keeps only hunks that overlap with your PR changes
+- Excludes hunks that only exist due to the merge
+
+**Note**: This is a best-effort approach and may not be perfect in all scenarios. Complex merge situations or interleaved changes might still include some merge-related code in the review.
+
 ## Inputs
 
 ***token*** - Required. This GitHub token is used for authentication and to access your GitHub repository.
