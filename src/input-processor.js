@@ -11,6 +11,7 @@ const DeepseekAgent = require("./deepseek-agent");
 const XAgent = require("./x-agent");
 const PerplexityAgent = require("./perplexity-agent");
 const { AI_REVIEW_COMMENT_PREFIX, SUMMARY_SEPARATOR } = require("./constants");
+const { filterPatchHunks } = require("./patch-utils");
 
 /* -------------------------------------------------------------------------- */
 /*                               Sanitizers                                   */
@@ -172,6 +173,10 @@ class InputProcessor {
     }
 
     async _processChangedFiles() {
+        // Store original PR base before any modifications
+        const originalPRBase = this._baseCommit;
+        let incrementalBaseCommit = this._baseCommit;
+
         const comments = await this._githubAPI.listPRComments(this._owner, this._repo, this._pullNumber);
         const lastReviewComment = [...comments].reverse().find(c => c.body && c.body.startsWith(AI_REVIEW_COMMENT_PREFIX));
 
@@ -184,19 +189,24 @@ class InputProcessor {
                 .trim();
 
             if (newBaseCommit) {
-                core.info(`New base commit ${newBaseCommit}. Incremental review will be performed`);
-                this._baseCommit = newBaseCommit;
+                incrementalBaseCommit = newBaseCommit;
+                core.info(`Incremental review from ${newBaseCommit} to ${this._headCommit}`);
             }
         } else {
-            core.info("No previous review comments found, reviewing all files in PR");
+            core.info("Full PR review: no previous review found");
         }
 
-        const changedFiles = await this._githubAPI.getFilesBetweenCommits(
+        let changedFiles = await this._githubAPI.getFilesBetweenCommits(
             this._owner,
             this._repo,
-            this._baseCommit,
+            incrementalBaseCommit,
             this._headCommit
         );
+
+        // Filter out merge-only files if doing incremental review
+        if (incrementalBaseCommit !== originalPRBase) {
+            changedFiles = await this._excludeMergeOnlyChanges(changedFiles, originalPRBase);
+        }
 
         this._filteredDiffs = this._filterChangedFiles(
             changedFiles,
@@ -206,7 +216,127 @@ class InputProcessor {
             this._excludePaths
         );
 
-        core.info(`Found ${this._filteredDiffs.length} files to review`);
+        core.info(`Found ${this._filteredDiffs.length} files to review after all filtering`);
+    }
+
+    /**
+     * Excludes merge-only changes from incremental review at the hunk level.
+     *
+     * When a PR branch is synced with the target branch (e.g., merging main into the PR),
+     * the incremental diff includes hunks (change blocks) from the merge commit that are
+     * not part of the developer's actual changes. This method excludes those by comparing:
+     *
+     * 1. Incremental diff: changes since last review
+     * 2. Whole PR diff: changes in the entire PR (from original base to head)
+     *
+     * For each file, only hunks that overlap with hunks in the whole PR are kept.
+     * If a file has no overlapping hunks (all merge-only), the entire file is excluded.
+     *
+     * HOW THE EXCLUSION WORKS:
+     *
+     * A hunk is KEPT if:
+     *   - It overlaps with any hunk in the whole PR diff
+     *   - This means the line ranges have some intersection
+     *
+     * A hunk is EXCLUDED if:
+     *   - It does NOT overlap with any hunk in the whole PR diff
+     *   - This means the changes came from the merge commit, not the PR author
+     *
+     * CONCRETE EXAMPLE:
+     *
+     * Timeline of events:
+     *   1. Commit A (developer adds feature) → AI reviews
+     *   2. Commit B (merge main into PR) → brings in unrelated changes from main
+     *   3. Commit C (developer fixes bug) → new changes to review
+     *
+     * File: utils.js
+     *
+     * Incremental diff (from last review to now):
+     *   Hunk 1: Lines 10-15 (from Commit B - someone else added logging in main)
+     *   Hunk 2: Lines 50-55 (from Commit C - developer's bug fix)
+     *   Hunk 3: Lines 100-105 (from Commit B - another change merged from main)
+     *
+     * Whole PR diff (from PR base to PR head):
+     *   Hunk A: Lines 20-25 (from Commit A - original feature)
+     *   Hunk B: Lines 50-55 (from Commit C - bug fix)
+     *   NOTE: Lines 10-15 and 100-105 are NOT here because they were already in main
+     *
+     * Filtering logic:
+     *   Hunk 1 (lines 10-15): NO overlap with any whole PR hunk → EXCLUDED
+     *   Hunk 2 (lines 50-55): Overlaps with Hunk B → KEPT (review this!)
+     *   Hunk 3 (lines 100-105): NO overlap with any whole PR hunk → EXCLUDED
+     *
+     * Result: Only Hunk 2 remains for AI review (the developer's actual new change)
+     *
+     * FILE-LEVEL EXCLUSION:
+     *   - If a file appears in incremental diff but NOT in whole PR diff → entire file EXCLUDED (merge-only file)
+     *   - If all hunks in a file are excluded → entire file EXCLUDED (file touched by both developer and merge, but no new hunks to review)
+     *
+     * Why hunk-level filtering is needed:
+     * - Without filtering, AI would review code already in the target branch
+     * - More precise than file-level: handles cases where developer modifies same file as merge
+     * - Wastes fewer tokens by excluding only merge-only hunks, not entire files
+     * - Provides better "best effort" incremental review experience
+     *
+     * @param {Array} changedFiles - Files changed since last review
+     * @param {string} originalPRBase - Original PR base commit (target branch)
+     * @returns {Promise<Array>} Filtered list of files with filtered patches
+     */
+    async _excludeMergeOnlyChanges(changedFiles, originalPRBase) {
+        core.info(`Filtering incremental changes against whole PR at hunk level (base: ${originalPRBase})`);
+
+        const wholePRFiles = await this._githubAPI.getFilesBetweenCommits(
+            this._owner,
+            this._repo,
+            originalPRBase,
+            this._headCommit
+        );
+
+        // Create map of filename -> whole PR file object for fast lookup
+        const wholePRFileMap = new Map(wholePRFiles.map((f) => [f.filename, f]));
+
+        const beforeCount = changedFiles.length;
+        const filteredOutFiles = [];
+
+        // Filter files and their patches at hunk level
+        const filteredFiles = changedFiles
+            .map((incFile) => {
+                core.debug(`Checking incremental file: ${incFile.filename}`);
+                const prFile = wholePRFileMap.get(incFile.filename);
+
+                if (!prFile) {
+                    // File not in whole PR - it's merge-only
+                    filteredOutFiles.push(incFile.filename);
+                    core.debug(`File not in whole PR (merge-only): ${incFile.filename}`);
+                    return null;
+                }
+
+                // Filter hunks within the file
+                const filteredPatch = filterPatchHunks(incFile.patch, prFile.patch);
+
+                if (!filteredPatch) {
+                    // All hunks are merge-only
+                    filteredOutFiles.push(incFile.filename);
+                    core.debug(`All hunks in file are merge-only: ${incFile.filename}`);
+                    return null;
+                }
+
+                // Return file with filtered patch
+                return {
+                    ...incFile,
+                    patch: filteredPatch,
+                };
+            })
+            .filter((f) => f !== null); // Remove nulls
+
+        core.info(`Filtered ${beforeCount} incremental files to ${filteredFiles.length} files with PR-relevant hunks`);
+
+        // Log filtered-out files at debug level for troubleshooting
+        if (filteredOutFiles.length > 0) {
+            core.debug(`Filtered out files/hunks: ${filteredOutFiles.join(", ")}`);
+        }
+
+        return filteredFiles;
     }
 
     _filterChangedFiles(changedFiles, includeExtensions, excludeExtensions, includePaths, excludePaths) {

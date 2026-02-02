@@ -49,6 +49,7 @@
     "@actions/github": "^7.0.0",
     "@anthropic-ai/sdk": "^0.71.2",
     "@google/generative-ai": "^0.24.1",
+    "diff": "^8.0.3",
     "he": "^1.2.0",
     "openai": "^6.16.0",
     "shell-quote": "^1.8.3"
